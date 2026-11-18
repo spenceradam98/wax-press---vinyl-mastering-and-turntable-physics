@@ -1,0 +1,164 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NAME: WaxPress
+
+concurrency:
+  group: build-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (universal x86_64 + arm64, macOS 11 minimum)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Verify binaries run on macOS 11 (universal, minos <= 11.0)
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            minos=$(otool -arch all -l "$f" | awk '/LC_BUILD_VERSION/{m=1} /LC_VERSION_MIN_MACOSX/{v=1} m&&$1=="minos"{print $2; m=0} v&&$1=="version"{print $2; v=0}' | sort -V | tail -1)
+            archs=$(lipo -archs "$f")
+            echo "$f -> minos $minos, archs $archs"
+            [ -n "$minos" ] && [ "$(printf '%s\n11.0\n' "$minos" | sort -V | tail -1)" = "11.0" ] || { echo "::error::$f needs macOS $minos"; fail=1; }
+            case " $archs " in *x86_64*) ;; *) echo "::error::$f has no Intel slice"; fail=1;; esac
+            case " $archs " in *arm64*) ;; *) echo "::error::$f has no Apple Silicon slice"; fail=1;; esac
+          done < <(find build -path '*_artefacts/Release/*' -path '*/Contents/MacOS/*' -type f -print0)
+          exit $fail
+      - name: Engine tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Ad-hoc sign
+        run: |
+          shopt -s nullglob
+          for b in build/*_artefacts/Release/VST3/*.vst3 build/*_artefacts/Release/AU/*.component \
+                   build/*_artefacts/Release/Standalone/*.app build/*_artefacts/Release/*.app; do
+            codesign --force --deep --sign - "$b"
+          done
+      - name: Make .pkg installer
+        run: |
+          set -e
+          shopt -s nullglob
+          VERSION=$(grep -m1 -oE 'project\([^)]*VERSION [0-9.]+' CMakeLists.txt | grep -oE '[0-9.]+$')
+          ID=com.spenceradam98.$(echo "$NAME" | tr 'A-Z' 'a-z')
+          mkdir -p dist pkgs
+          stage() { # $1 = label, $2 = install location, rest = bundles
+            local label=$1 loc=$2; shift 2
+            [ $# -eq 0 ] && return 0
+            local root="stage/$label"; mkdir -p "$root"
+            for b in "$@"; do ditto "$b" "$root/$(basename "$b")"; done
+            pkgbuild --analyze --root "$root" "stage/$label.plist"
+            i=0; while /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "stage/$label.plist" 2>/dev/null; do i=$((i+1)); done
+            pkgbuild --root "$root" --component-plist "stage/$label.plist" --install-location "$loc" \
+                     --identifier "$ID.$label" --version "$VERSION" "pkgs/$label.pkg"
+          }
+          stage vst3 "/Library/Audio/Plug-Ins/VST3" build/*_artefacts/Release/VST3/*.vst3
+          stage au "/Library/Audio/Plug-Ins/Components" build/*_artefacts/Release/AU/*.component
+          stage app "/Applications" build/*_artefacts/Release/Standalone/*.app build/*_artefacts/Release/*.app
+          args=(); for p in pkgs/*.pkg; do args+=(--package "$p"); done
+          productbuild "${args[@]}" "dist/$NAME-$VERSION-macOS.pkg"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-mac
+          path: dist/*.pkg
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Engine tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Make Setup.exe
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\([^)]*VERSION ([0-9.]+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $vst3 = @(Get-ChildItem build/*_artefacts/Release/VST3/*.vst3 -ErrorAction SilentlyContinue)
+          $apps = @(Get-ChildItem build/*_artefacts/Release/Standalone/*.exe -ErrorAction SilentlyContinue) +
+                  @(Get-ChildItem build/*_artefacts/Release/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Test' })
+          $files = @(); $icons = @()
+          foreach ($v in $vst3) { $files += "Source: `"$($v.FullName)\*`"; DestDir: `"{commoncf64}\VST3\$($v.Name)`"; Flags: ignoreversion recursesubdirs createallsubdirs" }
+          foreach ($a in $apps) {
+            $files += "Source: `"$($a.FullName)`"; DestDir: `"{app}`"; Flags: ignoreversion"
+            $icons += "Name: `"{group}\$($a.BaseName)`"; Filename: `"{app}\$($a.Name)`""
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $iss = @"
+          [Setup]
+          AppId=com.spenceradam98.$($env:NAME.ToLower())
+          AppName=$env:NAME
+          AppVersion=$version
+          AppPublisher=spenceradam98
+          DefaultDirName={autopf}\$env:NAME
+          DefaultGroupName=$env:NAME
+          DisableProgramGroupPage=yes
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=admin
+          OutputDir=$((Resolve-Path dist).Path)
+          OutputBaseFilename=$env:NAME-$version-Windows-Setup
+          Compression=lzma2
+          SolidCompression=yes
+
+          [Files]
+          $($files -join "`r`n")
+
+          [Icons]
+          $($icons -join "`r`n")
+          "@
+          $iss = ($iss -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`r`n"
+          Set-Content -Path installer.iss -Value $iss -Encoding UTF8
+          Get-Content installer.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-windows
+          path: dist/*.exe
+
+  release:
+    # Publishes the installers to a GitHub Release named after the CMake project version
+    # on every successful build of main (and on v* tags). Re-runs replace the files.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: ver
+        run: echo "version=$(grep -m1 -oE 'project\([^)]*VERSION [0-9.]+' CMakeLists.txt | grep -oE '[0-9.]+$')" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Installers built by GitHub Actions from ${{ github.sha }}.
+            macOS: universal (Intel + Apple Silicon), macOS 11 or later. Unsigned: right-click the .pkg and choose Open.
+            Windows: 64-bit Setup.exe (VST3 goes to Common Files\VST3).
+          files: dist/*
+          overwrite_files: true
