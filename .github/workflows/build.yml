@@ -76,8 +76,10 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - name: Allow long paths (long repo names break the JUCE checkout)
+        run: git config --global core.longpaths true
       - name: Configure
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DFETCHCONTENT_BASE_DIR=C:/fc
       - name: Build
         run: cmake --build build --config Release --parallel 4
       - name: Engine tests
